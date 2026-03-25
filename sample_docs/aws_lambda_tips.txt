@@ -1,0 +1,122 @@
+AWS Lambda Tips and Optimisation Patterns
+==========================================
+
+INTRODUCTION
+AWS Lambda is a serverless compute service that executes code in response to
+events without requiring server management.  Used correctly it can be both
+highly performant and extremely cost-efficient.  These tips cover the most
+impactful operational considerations.
+
+
+COLD STARTS
+A cold start occurs when Lambda must initialise a new execution environment
+before invoking your handler.  It adds 200ms–2s of latency depending on runtime
+and package size.  Mitigation strategies:
+
+  - Choose a compiled or lightweight runtime: Python and Node.js cold starts
+    are significantly faster than Java or .NET on default settings.
+  - Keep deployment package size small: remove unused dependencies, use Lambda
+    Layers for shared libraries (see below).
+  - Move expensive initialisation (SDK clients, DB connections, config loading)
+    outside the handler function so it runs once per execution environment and
+    is reused across warm invocations.
+  - Use Provisioned Concurrency for latency-sensitive APIs (see below).
+
+
+MEMORY AND TIMEOUT TUNING
+Lambda allocates CPU proportionally to memory.  Increasing memory from 128 MB
+to 512 MB can more than quadruple available CPU, sometimes making functions run
+faster while costing the same or less (duration * memory = GB-seconds billed).
+
+Use AWS Lambda Power Tuning (open-source Step Functions state machine) to
+empirically find the optimal memory setting for your workload.  Always set the
+timeout conservatively short — a runaway function at the default 15-minute
+maximum is expensive.  Most synchronous API handlers should have a 3–30s
+timeout; set it 20% above your p99 observed duration.
+
+
+LAMBDA LAYERS
+Layers are ZIP archives attached to multiple functions, sharing libraries
+without inflating individual deployment packages:
+
+  - Package large dependencies (pandas, numpy, Pillow, boto3) as a Layer.
+  - Version Layers independently from function code.
+  - Share Layers across the same account or publish them publicly.
+  - Maximum: 5 Layers per function, 250 MB total unzipped.
+
+AWS publishes official Layers for the AWS SDK and popular runtimes.  The boto3
+included in the Lambda execution environment is often slightly outdated; pin
+your own version via a Layer when new APIs are needed.
+
+
+ENVIRONMENT VARIABLES
+Store configuration in environment variables rather than hard-coding it.  For
+sensitive values use AWS Systems Manager Parameter Store (free) or AWS Secrets
+Manager (paid, supports automatic rotation):
+
+  - SSM Parameter Store: load at cold-start with get_parameter(WithDecryption=True).
+  - Secrets Manager: use the AWS-provided Lambda extension to cache secrets and
+    reduce API calls; values are refreshed automatically on rotation.
+
+Never store credentials in environment variables for cross-account access;
+use IAM roles instead.
+
+
+VPC CONSIDERATIONS
+Placing a Lambda function inside a VPC adds 1–10ms of ENI attachment latency
+on cold starts (the Hyperplane ENI model introduced in 2019 largely eliminated
+the original 10–30s VPC cold-start penalty).  Only put Lambda in a VPC when:
+
+  - It must reach RDS, ElastiCache, or other VPC-private resources.
+  - Egress must be controlled via a NAT Gateway.
+
+If VPC access is needed, deploy in private subnets with a NAT Gateway for
+outbound internet.  Avoid public subnets for Lambda — it gains no public IP
+by default and the placement achieves nothing.
+
+
+PROVISIONED CONCURRENCY
+Provisioned Concurrency pre-warms a set number of execution environments,
+eliminating cold starts for those invocations entirely.  Use it for:
+
+  - User-facing APIs with strict p99 SLAs (< 100ms response requirement).
+  - Functions invoked on a predictable schedule (e.g., business hours).
+
+Configure it via Application Auto Scaling to scale provisioned concurrency up
+before peak hours and down overnight, reducing cost.
+
+
+DEAD LETTER QUEUES (DLQ)
+For asynchronous Lambda invocations (SNS, S3 events, EventBridge), configure a
+DLQ (SQS queue or SNS topic) to capture events that fail after Lambda's built-in
+retry attempts (default 2 retries).  Without a DLQ, failed events are silently
+discarded.  Set a CloudWatch alarm on the DLQ depth to alert on-call engineers.
+
+
+AWS X-RAY TRACING
+Enable active X-Ray tracing on every production Lambda to get end-to-end
+distributed traces across services:
+
+  aws lambda update-function-configuration \
+    --function-name my-function \
+    --tracing-config Mode=Active
+
+Instrument downstream calls (DynamoDB, S3, SQS, HTTP) using the X-Ray SDK or
+the AWS Distro for OpenTelemetry (ADOT) Lambda Layer for vendor-neutral traces.
+X-Ray sampling rules let you control trace volume and cost.
+
+
+COST OPTIMISATION
+Lambda pricing has two components: requests ($0.20 per million) and duration
+(GB-seconds).  Cost reduction strategies:
+
+  - Right-size memory: run Power Tuning to find the cheapest memory/duration
+    combination for each function.
+  - Batch SQS processing: use reportBatchItemFailures to retry only failed
+    records in a batch, reducing duplicate invocations.
+  - Avoid polling tight loops: use event-driven triggers (SQS, SNS, S3, DynamoDB
+    Streams) rather than scheduled EventBridge rules that invoke Lambda every
+    minute just to check for work.
+  - Compress payloads passed between services to reduce duration spent on I/O.
+  - Use Graviton2 (arm64) architecture: 20% cheaper and typically 20% faster
+    than x86_64 for CPU-bound workloads; requires recompiling native extensions.

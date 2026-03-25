@@ -1,0 +1,105 @@
+Kubernetes Operational Guide — Core Concepts and Best Practices
+==============================================================
+
+INTRODUCTION
+Kubernetes (K8s) is a container-orchestration platform that automates deployment,
+scaling, and management of containerised applications.  This guide covers the
+fundamental primitives and operational patterns every engineering team needs.
+
+
+PODS
+A Pod is the smallest deployable unit in Kubernetes.  It encapsulates one or
+more containers that share a network namespace and storage volumes.  Avoid
+running multiple unrelated processes in a single Pod; instead, use sidecar
+containers only when they are tightly coupled to the primary container (e.g., a
+log-shipping agent or an Envoy proxy).  Every Pod gets a unique cluster-scoped
+IP address.  Pods are ephemeral — never rely on a Pod IP persisting across
+restarts.
+
+
+DEPLOYMENTS
+Use a Deployment to manage a ReplicaSet of identical Pods.  Deployments support
+rolling updates (default), blue-green, and canary strategies.  Key fields:
+
+  replicas: 3                          # desired Pod count
+  strategy.type: RollingUpdate
+  strategy.rollingUpdate.maxSurge: 1   # extra Pods during update
+  strategy.rollingUpdate.maxUnavailable: 0  # zero-downtime requirement
+
+Always set both `requests` and `limits` on every container spec so the
+scheduler can bin-pack nodes correctly and prevent noisy-neighbour starvation.
+
+
+SERVICES
+A Service provides a stable virtual IP (ClusterIP) and DNS name in front of a
+dynamic set of Pods selected by label.  Choose the right type:
+
+  - ClusterIP   — internal traffic only (default).
+  - NodePort    — exposes a port on every node; useful for on-prem testing.
+  - LoadBalancer — provisions a cloud load balancer; preferred for production
+    ingress in managed clusters (EKS, GKE, AKS).
+  - ExternalName — maps a service to an external DNS name.
+
+
+NAMESPACES
+Namespaces provide soft multi-tenancy within a single cluster.  Use them to
+isolate environments (dev, staging, prod), teams, or compliance domains.  Apply
+ResourceQuota and LimitRange objects per namespace to prevent a single team
+from monopolising cluster resources.
+
+
+RESOURCE LIMITS
+Always specify resource requests and limits:
+
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "512Mi"
+
+Setting limits without requests causes the scheduler to default requests to the
+limit value, which can lead to poor bin-packing.  CPU throttling is silent;
+memory exhaustion kills the container with OOMKilled.
+
+
+HEALTH CHECKS
+Configure both probes on every production container:
+
+  livenessProbe  — restarts the container if it enters a deadlock or crashes.
+  readinessProbe — removes the Pod from Service endpoints during startup or
+                   when temporarily unable to serve traffic.
+
+Use an HTTP GET probe on a dedicated /healthz endpoint that checks internal
+state, not just "the process is alive".  Set initialDelaySeconds generously to
+avoid restart loops during slow application startups.
+
+
+HORIZONTAL POD AUTOSCALER (HPA)
+HPA automatically scales Deployment replicas based on observed CPU, memory, or
+custom metrics:
+
+  kubectl autoscale deployment my-app --cpu-percent=60 --min=2 --max=20
+
+Pair HPA with the Cluster Autoscaler (or Karpenter on AWS) so that new nodes
+are provisioned when the cluster is at capacity.  Set targetAverageUtilization
+conservatively (50–70%) to leave headroom for traffic spikes before the new
+Pods become ready.
+
+
+TROUBLESHOOTING TIPS
+
+  kubectl describe pod <name>     — shows events: ImagePullBackOff,
+                                    OOMKilled, CrashLoopBackOff causes.
+  kubectl logs <pod> --previous  — logs from the last terminated container.
+  kubectl top pod                 — live CPU/memory; requires Metrics Server.
+  kubectl exec -it <pod> -- sh   — interactive shell for in-cluster debugging.
+  kubectl get events --sort-by=.metadata.creationTimestamp
+                                  — chronological event stream for the namespace.
+
+Common issues:
+  - Pending Pods: insufficient node resources or PVC not bound.
+  - ImagePullBackOff: invalid image tag, private registry without imagePullSecret.
+  - CrashLoopBackOff: application error on startup — check logs with --previous.
+  - Service not routing: label selector mismatch between Service and Pod spec.

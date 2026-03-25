@@ -1,0 +1,126 @@
+Docker Best Practices for Production Workloads
+===============================================
+
+INTRODUCTION
+Docker containers are the de-facto packaging format for modern cloud-native
+applications.  Following these practices from the start prevents security
+vulnerabilities, bloated images, and CI/CD pipeline bottlenecks.
+
+
+MULTI-STAGE BUILDS
+Use multi-stage builds to separate the build environment from the runtime
+image.  This eliminates compilers, test frameworks, and intermediate artefacts
+from the final image, often reducing its size by 60–80%.
+
+  # Stage 1: build
+  FROM golang:1.22 AS builder
+  WORKDIR /app
+  COPY . .
+  RUN go build -o server ./cmd/server
+
+  # Stage 2: minimal runtime
+  FROM gcr.io/distroless/static-debian12
+  COPY --from=builder /app/server /server
+  ENTRYPOINT ["/server"]
+
+For Python applications, install dependencies in a builder stage into a
+virtual environment, then copy only the venv into a slim runtime image.
+
+
+LAYER CACHING
+Docker caches each layer; invalidating one layer invalidates all subsequent
+layers.  Order instructions from least-frequently-changed to most:
+
+  1. Base image and system packages (rarely change)
+  2. Dependency manifests (requirements.txt, package.json)
+  3. pip/npm install (only re-runs when manifests change)
+  4. Application source code (changes on every commit)
+
+Separating COPY requirements.txt . / RUN pip install from COPY . . can
+cut build times from minutes to seconds on iterative development.
+
+
+.DOCKERIGNORE
+Always include a .dockerignore file to exclude unnecessary files from the
+build context, which reduces context transfer time and prevents accidental
+inclusion of secrets:
+
+  .git
+  .env
+  __pycache__
+  *.pyc
+  node_modules
+  .pytest_cache
+  coverage/
+  *.log
+  .DS_Store
+
+
+NON-ROOT USERS
+Running as root inside a container is a significant security risk.  If the
+container is compromised, the attacker has root on the host's kernel.  Create
+a dedicated user:
+
+  RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+  USER appuser
+
+For distroless images, use the built-in nonroot user (UID 65532).  Ensure that
+file permissions on copied artefacts allow the non-root user to read them.
+
+
+IMAGE SCANNING
+Integrate image vulnerability scanning into CI before pushing to your registry:
+
+  - Trivy (open-source, fast): trivy image myapp:latest
+  - Docker Scout: docker scout cves myapp:latest
+  - Amazon ECR: enable enhanced scanning (Snyk-powered) on push events.
+
+Pin base images to digests (FROM python:3.12-slim@sha256:...) in production
+Dockerfiles to guarantee reproducible, tamper-evident builds.
+
+
+TAGGING STRATEGIES
+Never use latest as the only tag in production.  Use a combination of:
+
+  - Git SHA tag    : myapp:a3f9c1b  — immutable, perfect for deployments
+  - Semantic version: myapp:2.4.1   — human-readable release marker
+  - Branch tag     : myapp:main     — useful for integration environments
+
+Automate tagging in CI using the commit SHA: docker build -t myapp:${GIT_SHA} .
+
+
+DOCKER COMPOSE FOR LOCAL DEVELOPMENT
+Use Docker Compose to replicate the full service graph locally.  Mount source
+code as a volume (not baked into the image) for hot-reload development:
+
+  services:
+    app:
+      build: .
+      volumes:
+        - .:/app
+      environment:
+        - DEBUG=true
+    db:
+      image: postgres:16-alpine
+      environment:
+        POSTGRES_PASSWORD: devpassword
+
+Keep a separate docker-compose.override.yml for local-only settings so that
+the base docker-compose.yml is safe to commit and use in CI.
+
+
+RESOURCE CONSTRAINTS
+Always set memory and CPU limits in production container orchestration to
+prevent a misbehaving container from starving its neighbours.  In Compose:
+
+  deploy:
+    resources:
+      limits:
+        cpus: "0.5"
+        memory: 512M
+      reservations:
+        memory: 256M
+
+In Kubernetes, translate these to resources.limits and resources.requests in
+the Pod spec.  Monitor actual usage with docker stats or kubectl top to tune
+limits over time and avoid both under-provisioning and wasteful over-allocation.

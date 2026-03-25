@@ -1,0 +1,36 @@
+# Environment files — never commit secrets
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# CDK
+cdk/cdk.out/
+cdk/.venv/
+
+# Lambda installed dependencies (installed locally via pip install -t)
+# Exclude all third-party packages; only handler.py and requirements.txt are source
+lambdas/web_search/*/
+lambdas/web_search/*.dist-info
+lambdas/web_search/*.egg-info
+lambdas/s3_search/*/
+lambdas/s3_search/*.dist-info
+lambdas/s3_search/*.egg-info
+lambdas/kb_search/*/
+lambdas/kb_search/*.dist-info
+lambdas/kb_search/*.egg-info
+lambdas/webhook_handler/*/
+lambdas/webhook_handler/*.dist-info
+lambdas/webhook_handler/*.egg-info
+
+# OS
+.DS_Store
+Thumbs.db
