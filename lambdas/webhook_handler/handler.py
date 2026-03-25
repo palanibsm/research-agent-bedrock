@@ -1,13 +1,10 @@
 """
-Telegram webhook handler — receives messages and invokes Bedrock Agent.
-
-Flow:
-  Telegram → API Gateway (POST /webhook) → this Lambda
-  → Bedrock Agent (invoke_agent) → streamed response
-  → send_telegram_message back to user
+Telegram webhook handler — receives messages and routes to AWS Bedrock or Azure OpenAI agent.
+Provider is stored in SSM Parameter Store and can be switched live via /switch command.
 """
 import json
 import os
+import time
 import logging
 import boto3
 import requests
@@ -15,126 +12,163 @@ import requests
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-BEDROCK_AGENT_ID = os.environ["BEDROCK_AGENT_ID"]
+TELEGRAM_BOT_TOKEN     = os.environ["TELEGRAM_BOT_TOKEN"]
+BEDROCK_AGENT_ID       = os.environ["BEDROCK_AGENT_ID"]
 BEDROCK_AGENT_ALIAS_ID = os.environ["BEDROCK_AGENT_ALIAS_ID"]
+AZURE_AGENT_FUNCTION   = os.environ.get("AZURE_AGENT_FUNCTION", "research-agent-azure-agent")
+SSM_PROVIDER_KEY       = os.environ.get("SSM_PROVIDER_KEY", "/research-agent/provider")
+
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-bedrock_agent_runtime = boto3.client(
-    "bedrock-agent-runtime",
-    region_name=os.environ.get("AWS_DEFAULT_REGION", "ap-southeast-1"),
-)
+REGION = os.environ.get("AWS_DEFAULT_REGION", "ap-southeast-1")
+bedrock_runtime = boto3.client("bedrock-agent-runtime", region_name=REGION)
+lambda_client   = boto3.client("lambda",                region_name=REGION)
+ssm             = boto3.client("ssm",                   region_name=REGION)
+
+# ── SSM-backed provider with 60-second in-process cache ──────────────────────
+
+_provider_cache: dict = {"value": None, "expires": 0}
+
+def get_provider() -> str:
+    now = time.time()
+    if _provider_cache["value"] and now < _provider_cache["expires"]:
+        return _provider_cache["value"]
+    try:
+        resp = ssm.get_parameter(Name=SSM_PROVIDER_KEY)
+        provider = resp["Parameter"]["Value"].lower().strip()
+    except ssm.exceptions.ParameterNotFound:
+        provider = "aws"
+        ssm.put_parameter(Name=SSM_PROVIDER_KEY, Value=provider, Type="String")
+    _provider_cache["value"] = provider
+    _provider_cache["expires"] = now + 60
+    return provider
+
+def set_provider(provider: str) -> None:
+    ssm.put_parameter(Name=SSM_PROVIDER_KEY, Value=provider, Type="String", Overwrite=True)
+    _provider_cache["value"] = provider
+    _provider_cache["expires"] = time.time() + 60
 
 
-def send_telegram_message(chat_id: str, text: str) -> None:
-    """Send a message back to the Telegram user.
+# ── Telegram helper ───────────────────────────────────────────────────────────
 
-    Telegram enforces a 4096-character limit per message, so long reports are
-    split into <=4000-character chunks and sent sequentially.
-    """
+def send_telegram_message(chat_id: str, text: str):
     url = f"{TELEGRAM_API}/sendMessage"
-    max_len = 4000
-    chunks = [text[i : i + max_len] for i in range(0, len(text), max_len)]
-    for chunk in chunks:
-        payload = {
-            "chat_id": chat_id,
-            "text": chunk,
-            "parse_mode": "Markdown",
-        }
-        resp = requests.post(url, json=payload, timeout=10)
-        resp.raise_for_status()
+    for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
+        requests.post(url, json={"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"}, timeout=10).raise_for_status()
 
+
+# ── Agent invocation ──────────────────────────────────────────────────────────
 
 def invoke_bedrock_agent(session_id: str, query: str) -> str:
-    """Invoke the Bedrock Agent and collect the streamed response into a string.
-
-    The Bedrock Agent runtime returns an EventStream; we iterate over every
-    event and concatenate the decoded bytes from each ``chunk`` event.
-    """
-    response = bedrock_agent_runtime.invoke_agent(
+    response = bedrock_runtime.invoke_agent(
         agentId=BEDROCK_AGENT_ID,
         agentAliasId=BEDROCK_AGENT_ALIAS_ID,
         sessionId=session_id,
         inputText=query,
     )
-
-    completion = ""
+    result = ""
     for event in response["completion"]:
         if "chunk" in event:
-            chunk_data = event["chunk"]["bytes"]
-            completion += chunk_data.decode("utf-8")
+            result += event["chunk"]["bytes"].decode("utf-8")
+    return result
 
-    return completion
+def invoke_azure_agent(query: str) -> str:
+    response = lambda_client.invoke(
+        FunctionName=AZURE_AGENT_FUNCTION,
+        InvocationType="RequestResponse",
+        Payload=json.dumps({"query": query}),
+    )
+    result = json.loads(response["Payload"].read())
+    if "error" in result:
+        raise RuntimeError(f"Azure agent error: {result['error']}")
+    return result.get("report", "No report generated.")
 
+
+# ── Provider labels ───────────────────────────────────────────────────────────
+
+PROVIDER_LABELS = {
+    "aws":   "AWS Bedrock — Claude 3.5 Sonnet",
+    "azure": "Azure OpenAI — GPT-4o",
+}
+
+def label(provider: str) -> str:
+    return PROVIDER_LABELS.get(provider, provider.upper())
+
+
+# ── Command handlers ──────────────────────────────────────────────────────────
+
+def handle_start(chat_id: str):
+    provider = get_provider()
+    send_telegram_message(chat_id,
+        f"👋 *Welcome to Research Analyst Bot!*\n\n"
+        f"Active provider: *{label(provider)}*\n\n"
+        f"*Commands:*\n"
+        f"  /switch — toggle between AWS Bedrock and Azure OpenAI\n"
+        f"  /provider — show current active provider\n\n"
+        f"Send any technical research question to get a comprehensive report.\n"
+        f"_Example: What are the best practices for containerizing microservices?_"
+    )
+
+def handle_provider(chat_id: str):
+    provider = get_provider()
+    send_telegram_message(chat_id, f"🔌 Current provider: *{label(provider)}*")
+
+def handle_switch(chat_id: str):
+    current = get_provider()
+    new_provider = "azure" if current == "aws" else "aws"
+    set_provider(new_provider)
+    send_telegram_message(chat_id,
+        f"✅ *Provider switched!*\n\n"
+        f"From: {label(current)}\n"
+        f"To:   *{label(new_provider)}*\n\n"
+        f"Your next research query will use *{label(new_provider)}*."
+    )
+
+
+# ── Lambda handler ────────────────────────────────────────────────────────────
 
 def lambda_handler(event, context):
-    """Entry point.  Must always return HTTP 200 so Telegram stops retrying."""
     chat_id = ""
     try:
-        body = json.loads(event.get("body") or "{}")
-        logger.info("Received update: %s", json.dumps(body))
-
+        body    = json.loads(event.get("body", "{}"))
         message = body.get("message", {})
         chat_id = str(message.get("chat", {}).get("id", ""))
-        text = message.get("text", "").strip()
+        text    = message.get("text", "").strip()
 
         if not chat_id or not text:
             return {"statusCode": 200, "body": "ok"}
 
-        # Handle /start command
+        # ── Commands ──────────────────────────────────────────────────────────
         if text.startswith("/start"):
-            send_telegram_message(
-                chat_id,
-                (
-                    "*Welcome to the Technical Research Analyst Bot!*\n\n"
-                    "Send me any technical research question and I will search:\n"
-                    "  - The *web* (live results via Tavily)\n"
-                    "  - Our *internal document library* (S3)\n"
-                    "  - The *knowledge base* (semantic/vector search)\n\n"
-                    "I will return a comprehensive, email-ready research report.\n\n"
-                    "*Example queries:*\n"
-                    "- _What are the best practices for containerising microservices?_\n"
-                    "- _How does Kubernetes horizontal pod autoscaling work?_\n"
-                    "- _How can I reduce AWS Lambda cold-start latency?_"
-                ),
-            )
+            handle_start(chat_id)
             return {"statusCode": 200, "body": "ok"}
 
-        # Ignore other bot commands
-        if text.startswith("/"):
-            send_telegram_message(
-                chat_id,
-                "Unknown command. Send a research question or /start to see usage.",
-            )
+        if text.startswith("/switch"):
+            handle_switch(chat_id)
             return {"statusCode": 200, "body": "ok"}
 
-        # Acknowledge receipt so the user knows work has started
-        send_telegram_message(
-            chat_id,
-            "Researching your query... This may take 30-60 seconds.",
+        if text.startswith("/provider"):
+            handle_provider(chat_id)
+            return {"statusCode": 200, "body": "ok"}
+
+        # ── Research query ────────────────────────────────────────────────────
+        provider = get_provider()
+        send_telegram_message(chat_id,
+            f"🔍 Researching via *{label(provider)}*... Please wait 30-60 seconds."
         )
 
-        # Invoke Bedrock Agent — session_id is the chat_id so context persists
-        report = invoke_bedrock_agent(session_id=chat_id, query=text)
+        if provider == "azure":
+            report = invoke_azure_agent(query=text)
+        else:
+            report = invoke_bedrock_agent(session_id=chat_id, query=text)
 
-        if not report.strip():
-            report = (
-                "The agent returned an empty response. "
-                "Please try rephrasing your query."
-            )
-
-        # Deliver the report
         send_telegram_message(chat_id, report)
 
-    except Exception as exc:
+    except Exception as e:
         logger.exception("Error processing webhook")
-        if chat_id:
-            try:
-                send_telegram_message(
-                    chat_id,
-                    f"An error occurred while processing your request: {exc}\n\nPlease try again.",
-                )
-            except Exception:
-                pass  # best-effort; don't let a send failure mask the original error
+        try:
+            send_telegram_message(chat_id, f"❌ An error occurred: {str(e)}")
+        except Exception:
+            pass
 
     return {"statusCode": 200, "body": "ok"}

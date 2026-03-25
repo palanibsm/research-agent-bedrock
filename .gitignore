@@ -30,6 +30,9 @@ lambdas/kb_search/*.egg-info
 lambdas/webhook_handler/*/
 lambdas/webhook_handler/*.dist-info
 lambdas/webhook_handler/*.egg-info
+lambdas/azure_agent/*/
+lambdas/azure_agent/*.dist-info
+lambdas/azure_agent/*.egg-info
 
 # OS
 .DS_Store
