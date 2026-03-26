@@ -52,7 +52,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "s3_search",
-            "description": "Search the internal S3 technical document library (Kubernetes, Docker, AWS Lambda guides).",
+            "description": "Search the Azure Blob Storage technical document library for internal guides.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -109,7 +109,7 @@ SYSTEM_PROMPT = """You are an expert Technical Research Analyst. When a user sen
 Web Sources:
 - [Title] — [URL]
 
-Internal Documents (S3):
+Internal Documents (Azure Blob):
 - [Filename] — [What was found]
 
 Knowledge Base:
@@ -170,7 +170,7 @@ def _execute_tool(tool_name: str, arguments: dict) -> str:
     if tool_name == "web_search":
         result = _invoke_lambda("research-agent-web-search", query)
     elif tool_name == "s3_search":
-        result = _invoke_lambda("research-agent-s3-search", query)
+        result = _invoke_lambda("research-agent-azure-blob-search", query)
     elif tool_name == "kb_search":
         result = {"note": "Knowledge Base not configured for Azure provider. Results from web and S3 only."}
     else:

@@ -25,7 +25,7 @@ from aws_cdk import (
     aws_lambda as lambda_,
     aws_apigateway as apigw,
     aws_bedrock as bedrock,
-    aws_ssm as ssm,
+    aws_dynamodb as dynamodb,
 )
 from constructs import Construct
 
@@ -246,6 +246,32 @@ class ResearchAgentStack(Stack):
         # Grant read-only access to the documents bucket
         docs_bucket.grant_read(s3_search_fn)
 
+        # ── DynamoDB: provider state ───────────────────────────────────────────
+        state_table = dynamodb.Table(
+            self, "StateTable",
+            table_name="research-agent-state",
+            partition_key=dynamodb.Attribute(name="pk", type=dynamodb.AttributeType.STRING),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        # ── Lambda: azure-blob-search-tool ────────────────────────────────────
+        azure_blob_search_fn = lambda_.Function(
+            self, "AzureBlobSearchFn",
+            function_name="research-agent-azure-blob-search",
+            runtime=runtime,
+            handler="handler.lambda_handler",
+            code=lambda_.Code.from_asset("../lambdas/azure_blob_search"),
+            timeout=Duration.seconds(30),
+            memory_size=256,
+            description="Tool: keyword search on Azure Blob Storage docs",
+            environment={
+                "AZURE_STORAGE_ACCOUNT_NAME": os.environ.get("AZURE_STORAGE_ACCOUNT_NAME", "REPLACE_ME"),
+                "AZURE_STORAGE_ACCOUNT_KEY": os.environ.get("AZURE_STORAGE_ACCOUNT_KEY", "REPLACE_ME"),
+                "AZURE_STORAGE_CONTAINER_NAME": os.environ.get("AZURE_STORAGE_CONTAINER_NAME", "research-docs"),
+            },
+        )
+
         # ── Lambda: kb-search-tool ─────────────────────────────────────────
         kb_search_fn = lambda_.Function(
             self,
@@ -270,14 +296,6 @@ class ResearchAgentStack(Stack):
             )
         )
 
-        # ── SSM Parameter: provider switch ────────────────────────────────
-        provider_param = ssm.StringParameter(
-            self, "ProviderParam",
-            parameter_name="/research-agent/provider",
-            string_value=os.environ.get("PROVIDER", "azure"),
-            description="Active AI provider: 'aws' (Bedrock) or 'azure' (Azure OpenAI). Update via Telegram /switch command.",
-        )
-
         # ── Lambda: webhook-handler ────────────────────────────────────────
         # BEDROCK_AGENT_ID and BEDROCK_AGENT_ALIAS_ID are available only after
         # the first deployment.  On the initial deploy they are set to
@@ -298,7 +316,8 @@ class ResearchAgentStack(Stack):
                 "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", "REPLACE_ME"),
                 "BEDROCK_AGENT_ID": os.environ.get("BEDROCK_AGENT_ID", "REPLACE_ME"),
                 "BEDROCK_AGENT_ALIAS_ID": os.environ.get("BEDROCK_AGENT_ALIAS_ID", "REPLACE_ME"),
-                "SSM_PROVIDER_KEY": "/research-agent/provider",
+                "DYNAMODB_TABLE_NAME": "research-agent-state",
+                "INFRA_MANAGER_FUNCTION": "research-agent-infra-manager",
                 "AZURE_AGENT_FUNCTION": "research-agent-azure-agent",
             },
         )
@@ -308,9 +327,8 @@ class ResearchAgentStack(Stack):
                 resources=["*"],
             )
         )
-        # Allow webhook to read and update the provider SSM parameter
-        provider_param.grant_read(webhook_fn)
-        provider_param.grant_write(webhook_fn)
+        # Allow webhook to read and write DynamoDB state
+        state_table.grant_read_write_data(webhook_fn)
 
         # ── Lambda: azure-agent ────────────────────────────────────────────
         azure_agent_fn = lambda_.Function(
@@ -332,10 +350,61 @@ class ResearchAgentStack(Stack):
         # Allow azure_agent to invoke the tool Lambdas
         azure_agent_fn.add_to_role_policy(iam.PolicyStatement(
             actions=["lambda:InvokeFunction"],
-            resources=[web_search_fn.function_arn, s3_search_fn.function_arn],
+            resources=[web_search_fn.function_arn, azure_blob_search_fn.function_arn],
         ))
         # Allow webhook to invoke azure_agent
         azure_agent_fn.grant_invoke(webhook_fn)
+        # Allow azure_agent to invoke azure_blob_search
+        azure_blob_search_fn.grant_invoke(azure_agent_fn)
+
+        # ── Lambda: infra-manager ──────────────────────────────────────────
+        infra_manager_fn = lambda_.Function(
+            self, "InfraManagerFn",
+            function_name="research-agent-infra-manager",
+            runtime=runtime,
+            handler="handler.lambda_handler",
+            code=lambda_.Code.from_asset("../lambdas/infra_manager"),
+            timeout=Duration.minutes(15),
+            memory_size=512,
+            description="Async infra manager: activate/deactivate AWS and Azure resources",
+            environment={
+                "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", "REPLACE_ME"),
+                "DYNAMODB_TABLE_NAME": "research-agent-state",
+                "S3_BUCKET_NAME": docs_bucket.bucket_name,
+                "BEDROCK_AGENT_ROLE_ARN": agent_role.role_arn,
+                "KNOWLEDGE_BASE_ID": os.environ.get("KNOWLEDGE_BASE_ID", "REPLACE_ME"),
+                "BEDROCK_AGENT_ID": os.environ.get("BEDROCK_AGENT_ID", "REPLACE_ME"),
+                "BEDROCK_AGENT_ALIAS_ID": os.environ.get("BEDROCK_AGENT_ALIAS_ID", "REPLACE_ME"),
+                "AZURE_OPENAI_ENDPOINT": os.environ.get("AZURE_OPENAI_ENDPOINT", "REPLACE_ME"),
+                "AZURE_OPENAI_API_KEY": os.environ.get("AZURE_OPENAI_API_KEY", "REPLACE_ME"),
+                "AZURE_OPENAI_DEPLOYMENT": os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o"),
+                "AZURE_OPENAI_API_VERSION": os.environ.get("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
+                "AZURE_TENANT_ID": os.environ.get("AZURE_TENANT_ID", ""),
+                "AZURE_CLIENT_ID": os.environ.get("AZURE_CLIENT_ID", ""),
+                "AZURE_CLIENT_SECRET": os.environ.get("AZURE_CLIENT_SECRET", ""),
+                "AZURE_SUBSCRIPTION_ID": os.environ.get("AZURE_SUBSCRIPTION_ID", ""),
+                "AZURE_RESOURCE_GROUP": os.environ.get("AZURE_RESOURCE_GROUP", ""),
+                "AZURE_OPENAI_RESOURCE_NAME": os.environ.get("AZURE_OPENAI_RESOURCE_NAME", ""),
+            },
+        )
+        # IAM permissions for infra_manager
+        infra_manager_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=[
+                "bedrock:DeleteAgent", "bedrock:CreateAgent", "bedrock:PrepareAgent",
+                "bedrock:CreateAgentAlias", "bedrock:DeleteAgentAlias",
+                "bedrock:CreateKnowledgeBase", "bedrock:DeleteKnowledgeBase",
+                "bedrock:CreateDataSource", "bedrock:DeleteDataSource",
+                "bedrock:StartIngestionJob",
+                "bedrock:ListDataSources",
+                "aoss:CreateCollection", "aoss:DeleteCollection", "aoss:BatchGetCollection",
+                "aoss:ListCollections", "aoss:CreateSecurityPolicy", "aoss:CreateAccessPolicy",
+                "lambda:GetFunctionConfiguration", "lambda:UpdateFunctionConfiguration",
+                "iam:PassRole",
+            ],
+            resources=["*"],
+        ))
+        state_table.grant_read_write_data(infra_manager_fn)
+        infra_manager_fn.grant_invoke(webhook_fn)
 
         # ── API Gateway ────────────────────────────────────────────────────
         api = apigw.RestApi(
@@ -481,7 +550,7 @@ class ResearchAgentStack(Stack):
             value=webhook_fn.function_arn,
             description="ARN of the Telegram webhook handler Lambda",
         )
-        CfnOutput(self, "Provider",
-            value=os.environ.get("PROVIDER", "aws"),
-            description="Active provider: aws or azure",
+        CfnOutput(self, "DynamoDBTable",
+            value="research-agent-state",
+            description="DynamoDB table for provider state management",
         )
