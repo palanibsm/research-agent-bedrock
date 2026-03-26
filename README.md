@@ -435,6 +435,13 @@ Check DynamoDB permissions on the webhook Lambda role. The CDK stack grants `dyn
 ### /activateaws takes a long time
 This is expected — OpenSearch Serverless collection creation takes 8-12 minutes. The infra_manager Lambda has a 15-minute timeout and will send Telegram progress updates.
 
+### Web search returns errors (Runtime.ImportModuleError: tiktoken)
+The `tavily-python` SDK pulls in `tiktoken`, which has Windows-compiled native binaries that crash on Lambda's Linux runtime. The `web_search` Lambda uses direct REST calls to the Tavily API instead — no SDK. If you see this error after reinstalling deps, ensure you are running from the fixed `handler.py` (no `from tavily import TavilyClient`) and wipe the old packages:
+```bash
+find lambdas/web_search -mindepth 1 ! -name 'handler.py' ! -name 'requirements.txt' -exec rm -rf {} +
+pip install -r lambdas/web_search/requirements.txt -t lambdas/web_search/
+```
+
 ### CDK "Docker not running" error
 This project pre-installs Lambda dependencies locally — Docker is **not required**. Run the `pip install -r ... -t lambdas/<fn>/` commands from Step 1 before deploying.
 
