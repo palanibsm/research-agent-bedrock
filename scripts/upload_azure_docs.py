@@ -56,7 +56,7 @@ for doc in docs_dir.glob("*"):
     url = f"https://{ACCOUNT}.blob.core.windows.net{resource}"
     headers = auth_header("PUT", resource, "text/plain", len(content))
     r = requests.put(url, headers=headers, data=content, timeout=30)
-    status = "✓" if r.status_code in (200, 201) else "✗"
+    status = "OK" if r.status_code in (200, 201) else "FAIL"
     print(f"  {status} {doc.name} ({r.status_code})")
 
 print("\nDone.")
